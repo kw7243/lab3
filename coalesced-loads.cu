@@ -27,7 +27,7 @@ __global__ void non_coalesced_load(data_type *dst, data_type *src, int x) {
 
     // <!-- TODO: your code here -->
     uint32_t start = blockIdx.x* (x*blockDim.x);
-    for (int i = 0; i < x; i++) {
+    for (uint32_t i = 0; i < x; i++) {
         uint32_t k = start + i + threadIdx.x*x;
         dst[k] = src[k];
     }
@@ -39,8 +39,8 @@ __global__ void non_coalesced_load(data_type *dst, data_type *src, int x) {
 __global__ void coalesced_load(data_type *dst, data_type *src, int x) {
     // <!-- TODO: your code here -->
     uint32_t start = blockIdx.x* (x*blockDim.x);
-    for (int i = 0; i < x*blockDim.x; i += blockDim.x) {
-        uint32_t k = start + i + threadIdx.x;
+    for (uint32_t i = 0; i < x; i++) {
+        uint32_t k = start + i*blockDim.x + threadIdx.x;
         dst[k] = src[k];
     }
 }
