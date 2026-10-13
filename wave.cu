@@ -119,7 +119,48 @@ __global__ void wave_gpu_naive_step(
     float *u0,      /* pointer to GPU memory */
     float const *u1 /* pointer to GPU memory */
 ) {
-    /* TODO: your GPU code here... */
+
+    constexpr int32_t n_cells_x = Scene::n_cells_x;
+    constexpr int32_t n_cells_y = Scene::n_cells_y;
+    constexpr float c = Scene::c;
+    constexpr float dx = Scene::dx;
+    constexpr float dt = Scene::dt;
+
+    uint32_t bx = blockIdx.x;
+    uint32_t by = blockIdx.y;
+
+    uint32_t jx = threadIdx.x;
+    uint32_t jy = threadIdx.y;
+
+    uint32_t threads_y = blockDim.y;
+    uint32_t threads_x = blockDim.x;
+
+    uint32_t idx_y = by*threads_y + jy;
+    uint32_t idx_x = bx*threads_x + jx;
+
+    if (idx_y >= n_cells_y || idx_x >= n_cells_x) return;
+
+    int32_t idx = idx_y * n_cells_x + idx_x;
+    bool is_border =
+        (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
+            idx_y == n_cells_y - 1);
+    float u_next_val;
+    if (is_border || Scene::is_wall(idx_x, idx_y)) {
+        u_next_val = 0.0f;
+    } else if (Scene::is_source(idx_x, idx_y)) {
+        u_next_val = Scene::source_value(idx_x, idx_y, t);
+    } else {
+        constexpr float coeff = c * c * dt * dt / (dx * dx);
+        float damping = Scene::damping(idx_x, idx_y);
+        u_next_val =
+            ((2.0f - damping - 4.0f * coeff) * u1[idx] -
+                (1.0f - damping) * u0[idx] +
+                coeff *
+                    (u1[idx - 1] + u1[idx + 1] + u1[idx - n_cells_x] +
+                    u1[idx + n_cells_x]));
+    }
+    u0[idx] = u_next_val;
+
 }
 
 // 'wave_gpu_naive':
@@ -147,6 +188,24 @@ std::pair<float *, float *> wave_gpu_naive(
     float *u1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
+    // - block = collection of bulldozers assigned to SM (>=4 need to be planted to satisfy SM)
+	// - 256x256 toy example, how to divide 2D blocks? how to assign threads? 
+	// - do programmers a priori decide <<blocks, threads>>? (prolly not, they test diff combos)
+    dim3 block_size(16, 16);
+
+    dim3 num_blocks(
+        (Scene::n_cells_x + block_size.x - 1) / block_size.x,
+        (Scene::n_cells_y + block_size.y - 1) / block_size.y
+    );
+    
+    for (int32_t idx_step = 0; idx_step < n_steps; idx_step++) {
+        float t = t0 + idx_step * Scene::dt;
+        wave_gpu_naive_step<Scene><<<num_blocks, block_size>>>(t, u0, u1);
+        std::swap(u0, u1);
+    }
+
+    
+
     return {u0, u1};
 }
 
