@@ -2,13 +2,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <utility>
 #include <vector>
-
 void cuda_check(cudaError_t code, const char *file, int line) {
     if (code != cudaSuccess) {
         std::cerr << "CUDA error at " << file << ":" << line << ": "
@@ -16,15 +16,12 @@ void cuda_check(cudaError_t code, const char *file, int line) {
         exit(1);
     }
 }
-
 #define CUDA_CHECK(x) \
     do { \
         cuda_check((x), __FILE__, __LINE__); \
     } while (0)
-
 ////////////////////////////////////////////////////////////////////////////////
 // CPU Reference Implementation (Already Written)
-
 // 'wave_cpu_step':
 //
 // Input:
@@ -43,7 +40,6 @@ template <typename Scene> void wave_cpu_step(float t, float *u0, float const *u1
     constexpr float c = Scene::c;
     constexpr float dx = Scene::dx;
     constexpr float dt = Scene::dt;
-
     for (int32_t idx_y = 0; idx_y < n_cells_y; ++idx_y) {
         for (int32_t idx_x = 0; idx_x < n_cells_x; ++idx_x) {
             int32_t idx = idx_y * n_cells_x + idx_x;
@@ -69,7 +65,6 @@ template <typename Scene> void wave_cpu_step(float t, float *u0, float const *u1
         }
     }
 }
-
 // 'wave_cpu':
 //
 // Input:
@@ -95,12 +90,9 @@ std::pair<float *, float *> wave_cpu(float t0, int32_t n_steps, float *u0, float
     }
     return {u0, u1};
 }
-
 /// <--- your code here --->
-
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (Naive)
-
 // 'wave_gpu_step':
 //
 // Input:
@@ -119,27 +111,20 @@ __global__ void wave_gpu_naive_step(
     float *u0,      /* pointer to GPU memory */
     float const *u1 /* pointer to GPU memory */
 ) {
-
     constexpr int32_t n_cells_x = Scene::n_cells_x;
     constexpr int32_t n_cells_y = Scene::n_cells_y;
     constexpr float c = Scene::c;
     constexpr float dx = Scene::dx;
     constexpr float dt = Scene::dt;
-
     uint32_t bx = blockIdx.x;
     uint32_t by = blockIdx.y;
-
     uint32_t jx = threadIdx.x;
     uint32_t jy = threadIdx.y;
-
     uint32_t threads_y = blockDim.y;
     uint32_t threads_x = blockDim.x;
-
     uint32_t idx_y = by*threads_y + jy;
     uint32_t idx_x = bx*threads_x + jx;
-
     if (idx_y >= n_cells_y || idx_x >= n_cells_x) return;
-
     int32_t idx = idx_y * n_cells_x + idx_x;
     bool is_border =
         (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
@@ -160,9 +145,7 @@ __global__ void wave_gpu_naive_step(
                     u1[idx + n_cells_x]));
     }
     u0[idx] = u_next_val;
-
 }
-
 // 'wave_gpu_naive':
 //
 // Input:
@@ -189,34 +172,155 @@ std::pair<float *, float *> wave_gpu_naive(
 ) {
     /* TODO: your CPU code here... */
     // - block = collection of bulldozers assigned to SM (>=4 need to be planted to satisfy SM)
-	// - 256x256 toy example, how to divide 2D blocks? how to assign threads? 
-	// - do programmers a priori decide <<blocks, threads>>? (prolly not, they test diff combos)
+    // - 256x256 toy example, how to divide 2D blocks? how to assign threads?
+    // - do programmers a priori decide <<blocks, threads>>? (prolly not, they test diff combos)
     dim3 block_size(16, 16);
-
     dim3 num_blocks(
         (Scene::n_cells_x + block_size.x - 1) / block_size.x,
         (Scene::n_cells_y + block_size.y - 1) / block_size.y
     );
-    
     for (int32_t idx_step = 0; idx_step < n_steps; idx_step++) {
         float t = t0 + idx_step * Scene::dt;
         wave_gpu_naive_step<Scene><<<num_blocks, block_size>>>(t, u0, u1);
         std::swap(u0, u1);
     }
-
-    
-
     return {u0, u1};
 }
-
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Shared Memory)
+constexpr int IN_TILE_X = 20;
+constexpr int IN_TILE_Y = 20;
+constexpr int K = 2;
+constexpr int OUT_TILE_X = IN_TILE_X - 2*K;
+constexpr int OUT_TILE_Y = IN_TILE_Y - 2*K;
+static_assert(OUT_TILE_X > 0 && OUT_TILE_Y > 0,
+    "The timestep halo must leave a nonempty output tile");
+constexpr size_t shared_bytes = 2*IN_TILE_X*IN_TILE_Y*sizeof(float);
 
 template <typename Scene>
 __global__ void wave_gpu_shmem_multistep(
-    /* TODO: your arguments here... */
+    float t0,
+    int32_t first_step,
+    int32_t steps_this_launch,
+    const float *__restrict__ read0,
+    const float *__restrict__ read1,
+    float *__restrict__ write0,
+    float *__restrict__ write1
 ) {
     /* TODO: your GPU code here... */
+    constexpr int nx = Scene::n_cells_x;
+    constexpr int ny = Scene::n_cells_y;
+    constexpr float c = Scene::c;
+    constexpr float dx = Scene::dx;
+    constexpr float dt = Scene::dt;
+    constexpr float coeff = c*c*dt*dt/(dx*dx);
+
+    // for bx in range(gridDim.x)
+        // for by in range(gridDim.y)
+            // curr = sharedmem[IN_TILE_X*IN_TILE_Y]
+            // prev = sharedmem[IN_TILE_X*IN_TILE_Y]
+    extern __shared__ float shared[];
+    float *curr = shared;
+    float *prev = shared + IN_TILE_X*IN_TILE_Y;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int jx = threadIdx.x;
+    int jy = threadIdx.y;
+    int x_base = -K + bx*(OUT_TILE_X);
+    int y_base = -K + by*(OUT_TILE_Y);
+
+    // Load input tiles into shared mem
+    for (int jy_base = 0; jy_base < IN_TILE_Y; jy_base += blockDim.y) {
+        for (int jx_base = 0; jx_base < IN_TILE_X; jx_base += blockDim.x) {
+                // if 4+4+4 exceeds 4+4+2 fence on right
+                if (!(jx_base + jx < IN_TILE_X && jy_base + jy < IN_TILE_Y)) continue;
+
+                int x_global = x_base + jx_base + jx;
+                int y_global = y_base + jy_base + jy;
+                int i_local = (jy_base + jy)*IN_TILE_X + (jx_base + jx);
+
+                if (0 <= x_global && x_global < nx && 
+                    0 <= y_global && y_global < ny) { // thread in bounds (touch margins)
+                    int i = y_global*nx + x_global;
+                    prev[i_local] = read0[i];
+                    curr[i_local] = read1[i];
+                } else {
+                    prev[i_local] = 0.0f;
+                    curr[i_local] = 0.0f;
+                }
+        } // end jy_base
+    } // end jx_base
+    __syncthreads();
+
+
+    // Compute tiles, visual = 4-size block in 1D over IN_TILE = 20, margin of 2 both ends
+    for (int k = 1; k <= steps_this_launch; k++) {
+        float t = t0 + (first_step + k - 1)*dt;
+
+        for (int jy_base = 0; jy_base < IN_TILE_Y; jy_base += blockDim.y) {
+            for (int jx_base = 0; jx_base < IN_TILE_X; jx_base += blockDim.x) {
+                // only compute threads "pyramiding up" and in bounds
+                if (!(k <= jx_base + jx && jx_base + jx < IN_TILE_X - k &&
+                      k <= jy_base + jy && jy_base + jy < IN_TILE_Y - k)) continue;
+                
+                int x_global = x_base + jx_base + jx;
+                int y_global = y_base + jy_base + jy;
+                int i_local = (jy_base + jy)*IN_TILE_X + (jx_base + jx);
+                
+                float next;
+                
+                if (x_global <= 0 || x_global >= nx - 1 ||
+                    y_global <= 0 || y_global >= ny - 1 ||
+                    Scene::is_wall(x_global, y_global)) {
+                    next = 0.0f;
+                } else if (Scene::is_source(x_global, y_global)) {
+                    next = Scene::source_value(x_global, y_global, t);
+                } else {
+                    float damping = Scene::damping(x_global, y_global);
+                    next =
+                        (2.0f - damping - 4.0f * coeff) * curr[i_local]
+                        - (1.0f - damping) * prev[i_local]
+                        + coeff * (
+                            curr[i_local - 1] +
+                            curr[i_local + 1] +
+                            curr[i_local - IN_TILE_X] +
+                            curr[i_local + IN_TILE_X]
+                        );
+                }
+                prev[i_local] = next;
+            } // end jx_base
+        } // end jy_base
+        __syncthreads(); // ensures all block of 4 finishes at same time before moving to next time step
+
+        float *temp = prev;
+        prev = curr;
+        curr = temp;
+    } // end k
+
+
+    for (int jy_base = 0; jy_base < IN_TILE_Y; jy_base += blockDim.y) {
+        for (int jx_base = 0; jx_base < IN_TILE_X; jx_base += blockDim.x) {
+            // only write cells in output tile, otherwise
+            // white margin overlaps with next block's black output
+            // and write conflicts
+            if (!(K <= jx_base + jx && jx_base + jx < IN_TILE_X - K &&
+                  K <= jy_base + jy && jy_base + jy < IN_TILE_Y - K))
+                continue;
+
+            int x_global = x_base + jx_base + jx;
+            int y_global = y_base + jy_base + jy;
+            
+            // If out of bounds, skip
+            if (!(0 <= x_global && x_global < nx &&
+                  0 <= y_global && y_global < ny))
+                continue;
+
+            int i_local = (jy_base + jy)*IN_TILE_X + (jx_base + jx);
+            int i = y_global*nx + x_global;
+            write0[i] = prev[i_local];
+            write1[i] = curr[i_local];
+        } // end jx_base
+    } // end jy_base
 }
 
 // 'wave_gpu_shmem':
@@ -253,15 +357,32 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
-    return {u0, u1};
+    dim3 block_size(8, 8);
+    dim3 num_blocks(
+        (Scene::n_cells_x + OUT_TILE_X - 1) / OUT_TILE_X,
+        (Scene::n_cells_y + OUT_TILE_Y - 1) / OUT_TILE_Y
+    );
+    
+    float *read0 = u0;
+    float *write0 = extra0;
+    float *read1 = u1;
+    float *write1 = extra1;
+
+    for (int32_t first_step = 0; first_step < n_steps; first_step += K) {
+        int32_t steps = std::min(K, n_steps - first_step);
+        wave_gpu_shmem_multistep<Scene><<<num_blocks, block_size, shared_bytes>>>(
+            t0, first_step, steps, read0, read1, write0, write1
+        );
+        CUDA_CHECK(cudaGetLastError());
+        std::swap(read0, write0);
+        std::swap(read1, write1);
+    }
+    return {read0, read1};
 }
-
 /// <--- /your code here --->
-
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
 ////////////////////////////////////////////////////////////////////////////////
-
 struct BaseScene {
     constexpr static int32_t n_cells_x = 3201;
     constexpr static int32_t n_cells_y = 3201;
@@ -271,7 +392,6 @@ struct BaseScene {
     constexpr static float dt = 0.25f * dx / c;
     constexpr static float t_end = 1.0f;
 };
-
 struct BaseSceneSmallScale {
     constexpr static int32_t n_cells_x = 201;
     constexpr static int32_t n_cells_y = 201;
@@ -281,7 +401,6 @@ struct BaseSceneSmallScale {
     constexpr static float dt = 0.25f * dx / c;
     constexpr static float t_end = 1.0f;
 };
-
 float __host__ __device__ __forceinline__ boundary_damping(
     int32_t n_cells_x,
     int32_t n_cells_y,
@@ -296,58 +415,47 @@ float __host__ __device__ __forceinline__ boundary_damping(
     float f = max(fx, fy);
     return max_damping * f * f;
 }
-
 struct PointSource : public BaseScene {
     static __host__ __device__ __forceinline__ bool
     is_wall(int32_t idx_x, int32_t idx_y) {
         return false;
     }
-
     static __host__ __device__ __forceinline__ bool
     is_source(int32_t idx_x, int32_t idx_y) {
         return idx_x == (n_cells_x - 1) / 2 && idx_y == (n_cells_y - 1) / 2;
     }
-
     static __host__ __device__ __forceinline__ float
     source_value(int32_t idx_x, int32_t idx_y, float t) {
         return 10.0f * sinf(2.0f * 3.14159265359f * 20.0f * t);
     }
-
     static __host__ __device__ __forceinline__ float
     damping(int32_t idx_x, int32_t idx_y) {
         return boundary_damping(n_cells_x, n_cells_y, 0.1f, 0.5f, idx_x, idx_y);
     }
 };
-
 struct Slit : public BaseScene {
     constexpr static float slit_width = 0.05f;
-
     static __host__ __device__ __forceinline__ bool
     is_wall(int32_t idx_x, int32_t idx_y) {
         float y = float(idx_y) / (n_cells_y - 1);
         return idx_x == (n_cells_x - 1) / 2 &&
             (y < 0.5f - slit_width / 2 || y > 0.5f + slit_width / 2);
     }
-
     static __host__ __device__ __forceinline__ bool
     is_source(int32_t idx_x, int32_t idx_y) {
         return idx_x == (n_cells_x - 1) / 4 && idx_y == (n_cells_y - 1) / 2;
     }
-
     static __host__ __device__ __forceinline__ float
     source_value(int32_t idx_x, int32_t idx_y, float t) {
         return 10.0f * sinf(2.0f * 3.14159265359f * 40.0f * t);
     }
-
     static __host__ __device__ __forceinline__ float
     damping(int32_t idx_x, int32_t idx_y) {
         return boundary_damping(n_cells_x, n_cells_y, 0.1f, 0.5f, idx_x, idx_y);
     }
 };
-
 struct DoubleSlit : public BaseScene {
     constexpr static float slit_width = 0.03f;
-
     static __host__ __device__ __forceinline__ bool
     is_wall(int32_t idx_x, int32_t idx_y) {
         float y = float(idx_y) / (n_cells_y - 1);
@@ -355,26 +463,21 @@ struct DoubleSlit : public BaseScene {
             !((y >= 0.45f - slit_width / 2 && y <= 0.45f + slit_width / 2) ||
               (y >= 0.55f - slit_width / 2 && y <= 0.55f + slit_width / 2));
     }
-
     static __host__ __device__ __forceinline__ bool
     is_source(int32_t idx_x, int32_t idx_y) {
         return idx_x == (n_cells_x - 1) / 6 && idx_y == (n_cells_y - 1) / 2;
     }
-
     static __host__ __device__ __forceinline__ float
     source_value(int32_t idx_x, int32_t idx_y, float t) {
         return 10.0f * sinf(2.0f * 3.14159265359f * 20.0f * t);
     }
-
     static __host__ __device__ __forceinline__ float
     damping(int32_t idx_x, int32_t idx_y) {
         return boundary_damping(n_cells_x, n_cells_y, 0.1f, 0.5f, idx_x, idx_y);
     }
 };
-
 struct DoubleSlitSmallScale : public BaseSceneSmallScale {
     constexpr static float slit_width = 0.03f;
-
     static __host__ __device__ __forceinline__ bool
     is_wall(int32_t idx_x, int32_t idx_y) {
         constexpr float EPS = 1e-6;
@@ -383,23 +486,19 @@ struct DoubleSlitSmallScale : public BaseSceneSmallScale {
             !((y >= 0.45f - slit_width / 2 - EPS && y <= 0.45f + slit_width / 2 + EPS) ||
               (y >= 0.55f - slit_width / 2 - EPS && y <= 0.55f + slit_width / 2 + EPS));
     }
-
     static __host__ __device__ __forceinline__ bool
     is_source(int32_t idx_x, int32_t idx_y) {
         return idx_x == (n_cells_x - 1) / 6 && idx_y == (n_cells_y - 1) / 2;
     }
-
     static __host__ __device__ __forceinline__ float
     source_value(int32_t idx_x, int32_t idx_y, float t) {
         return 10.0f * sinf(2.0f * 3.14159265359f * 20.0f * t);
     }
-
     static __host__ __device__ __forceinline__ float
     damping(int32_t idx_x, int32_t idx_y) {
         return boundary_damping(n_cells_x, n_cells_y, 0.1f, 0.5f, idx_x, idx_y);
     }
 };
-
 // Output image writers: BMP file header structure
 #pragma pack(push, 1)
 struct BMPHeader {
@@ -421,7 +520,6 @@ struct BMPHeader {
     uint32_t importantColors{0}; // Number of important colors
 };
 #pragma pack(pop)
-
 void writeBMP(
     const char *fname,
     uint32_t width,
@@ -430,14 +528,11 @@ void writeBMP(
     BMPHeader header;
     header.width = width;
     header.height = height;
-
     uint32_t rowSize = (width * 3 + 3) & (~3); // Align to 4 bytes
     header.imageSize = rowSize * height;
     header.fileSize = header.dataOffset + header.imageSize;
-
     std::ofstream file(fname, std::ios::binary);
     file.write(reinterpret_cast<const char *>(&header), sizeof(header));
-
     // Write pixel data with padding
     std::vector<uint8_t> padding(rowSize - width * 3, 0);
     for (int32_t idx_y = height - 1; idx_y >= 0;
@@ -449,13 +544,11 @@ void writeBMP(
         }
     }
 }
-
 // If trunc - cut the border of the image.
 template <typename Scene>
 std::vector<uint8_t> render_wave(const float *u, int trunc = 0) {
     constexpr int32_t n_cells_x = Scene::n_cells_x;
     constexpr int32_t n_cells_y = Scene::n_cells_y;
-
     std::vector<uint8_t> pixels((n_cells_x - trunc) * (n_cells_y - trunc) * 3);
     for (int32_t idx_y = 0; idx_y < n_cells_y - trunc; ++idx_y) {
         for (int32_t idx_x = 0; idx_x < n_cells_x - trunc; ++idx_x) {
@@ -481,13 +574,11 @@ std::vector<uint8_t> render_wave(const float *u, int trunc = 0) {
     }
     return pixels;
 }
-
 struct Results {
     std::vector<float> u0_final;
     std::vector<float> u1_final;
     double time_ms;
 };
-
 template <typename Scene, typename F>
 Results run_cpu(
     float t0,
@@ -497,9 +588,7 @@ Results run_cpu(
     F func) {
     auto u0 = std::vector<float>(Scene::n_cells_x * Scene::n_cells_y);
     auto u1 = std::vector<float>(Scene::n_cells_x * Scene::n_cells_y);
-
     std::pair<float *, float *> u_final;
-
     double best_time = std::numeric_limits<double>::infinity();
     for (int32_t i = 0; i < num_iters_outer; ++i) {
         auto start = std::chrono::high_resolution_clock::now();
@@ -513,17 +602,14 @@ Results run_cpu(
             num_iters_inner;
         best_time = std::min(best_time, time_ms);
     }
-
     if (u_final.first == u1.data() && u_final.second == u0.data()) {
         std::swap(u0, u1);
     } else if (!(u_final.first == u0.data() && u_final.second == u1.data())) {
         std::cerr << "Unexpected return values from 'func'" << std::endl;
         std::abort();
     }
-
     return {std::move(u0), std::move(u1), best_time};
 }
-
 template <typename Scene, typename F>
 Results run_gpu(
     float t0,
@@ -536,19 +622,15 @@ Results run_gpu(
     float *u1;
     float *extra0 = nullptr;
     float *extra1 = nullptr;
-
     CUDA_CHECK(cudaMalloc(&u0, Scene::n_cells_x * Scene::n_cells_y * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&u1, Scene::n_cells_x * Scene::n_cells_y * sizeof(float)));
-
     if (use_extra) {
         CUDA_CHECK(
             cudaMalloc(&extra0, Scene::n_cells_x * Scene::n_cells_y * sizeof(float)));
         CUDA_CHECK(
             cudaMalloc(&extra1, Scene::n_cells_x * Scene::n_cells_y * sizeof(float)));
     }
-
     std::pair<float *, float *> u_final;
-
     double best_time = std::numeric_limits<double>::infinity();
     for (int32_t i = 0; i < num_iters_outer; ++i) {
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -576,7 +658,6 @@ Results run_gpu(
             num_iters_inner;
         best_time = std::min(best_time, time_ms);
     }
-
     if (u_final.first != u0 && u_final.first != u1 &&
         (extra0 == nullptr || u_final.first != extra0) &&
         (extra1 == nullptr || u_final.first != extra1)) {
@@ -584,7 +665,6 @@ Results run_gpu(
                   << std::endl;
         std::abort();
     }
-
     if (u_final.second != u0 && u_final.second != u1 &&
         (extra0 == nullptr || u_final.second != extra0) &&
         (extra1 == nullptr || u_final.second != extra1)) {
@@ -592,7 +672,6 @@ Results run_gpu(
                   << std::endl;
         std::abort();
     }
-
     auto u0_cpu = std::vector<float>(Scene::n_cells_x * Scene::n_cells_y);
     auto u1_cpu = std::vector<float>(Scene::n_cells_x * Scene::n_cells_y);
     CUDA_CHECK(cudaMemcpy(
@@ -605,17 +684,14 @@ Results run_gpu(
         u_final.second,
         Scene::n_cells_x * Scene::n_cells_y * sizeof(float),
         cudaMemcpyDeviceToHost));
-
     CUDA_CHECK(cudaFree(u0));
     CUDA_CHECK(cudaFree(u1));
     if (use_extra) {
         CUDA_CHECK(cudaFree(extra0));
         CUDA_CHECK(cudaFree(extra1));
     }
-
     return {std::move(u0_cpu), std::move(u1_cpu), best_time};
 }
-
 template <typename Scene, typename F>
 Results run_gpu_extra(
     float t0,
@@ -625,7 +701,6 @@ Results run_gpu_extra(
     F func) {
     return run_gpu<Scene>(t0, n_steps, num_iters_outer, num_iters_inner, true, func);
 }
-
 template <typename Scene, typename F>
 Results run_gpu_no_extra(
     float t0,
@@ -646,7 +721,6 @@ Results run_gpu_no_extra(
             float *extra0,
             float *extra1) { return func(t0, n_steps, u0, u1); });
 }
-
 double rel_rmse(std::vector<float> const &a, std::vector<float> const &b) {
     if (a.size() != b.size()) {
         std::cerr << "Mismatched sizes in 'rel_rmse'" << std::endl;
@@ -661,10 +735,8 @@ double rel_rmse(std::vector<float> const &a, std::vector<float> const &b) {
     }
     return sqrt(sum / a.size()) / sqrt(ref_sum / a.size());
 }
-
 // FFmpeg implementations.
 typedef std::vector<std::vector<uint8_t>> FFmpegFrames;
-
 // CPU implementation with FFmpeg framing.
 template <typename Scene>
 void wave_ffmpeg(float t0, int32_t n_steps, FFmpegFrames &frames) {
@@ -680,7 +752,6 @@ void wave_ffmpeg(float t0, int32_t n_steps, FFmpegFrames &frames) {
         frames.push_back(render_wave<Scene>(u1, 1));
     }
 }
-
 template <typename Scene>
 void wave_ffmpeg_gpu(float t0, int32_t n_steps, FFmpegFrames &frames) {
     static constexpr int32_t frame_step = 2;
@@ -704,7 +775,6 @@ void wave_ffmpeg_gpu(float t0, int32_t n_steps, FFmpegFrames &frames) {
         frames.push_back(render_wave<Scene>(u1_cpu.data(), 1));
     }
 }
-
 template <typename Scene>
 void wave_ffmpeg_gpu_shmem(float t0, int32_t n_steps, FFmpegFrames &frames) {
     static constexpr int32_t frame_step = 2;
@@ -753,7 +823,6 @@ void wave_ffmpeg_gpu_shmem(float t0, int32_t n_steps, FFmpegFrames &frames) {
         frames.push_back(render_wave<Scene>(u1_cpu.data(), 1));
     }
 }
-
 template <typename Scene>
 int generate_animation(const FFmpegFrames &frames, std::string fname) {
     std::string ffmpeg_command = "ffmpeg -y "
@@ -770,24 +839,20 @@ int generate_animation(const FFmpegFrames &frames, std::string fname) {
         "-c:v libx264 "
         "-pix_fmt yuv420p " +
         fname + ".mp4" + " 2> /dev/null";
-
     FILE *pipe = popen(ffmpeg_command.c_str(), "w");
     if (!pipe) {
         std::cerr << "Failed to open pipe to FFmpeg." << std::endl;
         return 1;
     }
-
     for (auto &frame : frames) {
         if (fwrite(frame.data(), 1, frame.size(), pipe) != frame.size()) {
             std::cerr << "Failed to write frame to FFmpeg." << std::endl;
             return 1;
         }
     }
-
     pclose(pipe);
     return 0;
 }
-
 int main(int argc, char **argv) {
     // Small scale tests: mainly for correctness.
     double tolerance = 3e-2;
@@ -796,7 +861,6 @@ int main(int argc, char **argv) {
     {
         printf("Small scale tests (on scene 'DoubleSlitSmallScale'):\n");
         using Scene = DoubleSlitSmallScale;
-
         // CPU.
         int32_t n_steps = Scene::t_end / Scene::dt;
         auto cpu_results = run_cpu<Scene>(0.0f, n_steps, 1, 1, wave_cpu<Scene>);
@@ -808,7 +872,6 @@ int main(int argc, char **argv) {
         printf("  CPU sequential implementation:\n");
         printf("    run time: %.2f ms\n", cpu_results.time_ms);
         printf("\n");
-
         // GPU: wave_gpu_naive.
         auto gpu_naive_results =
             run_gpu_no_extra<Scene>(0.0f, n_steps, 1, 1, wave_gpu_naive<Scene>);
@@ -826,7 +889,6 @@ int main(int argc, char **argv) {
         printf("    run time: %.2f ms\n", gpu_naive_results.time_ms);
         printf("    correctness: %.2e relative RMSE\n", naive_rel_rmse);
         printf("\n");
-
         // GPU: wave_gpu_shmem.
         auto gpu_shmem_results =
             run_gpu_extra<Scene>(0.0f, n_steps, 1, 1, wave_gpu_shmem<Scene>);
@@ -844,7 +906,6 @@ int main(int argc, char **argv) {
         printf("    run time: %.2f ms\n", gpu_shmem_results.time_ms);
         printf("    correctness: %.2e relative RMSE\n", shmem_rel_rmse);
         printf("\n");
-
         if (gpu_naive_correct) {
             printf(
                 "  CPU -> GPU naive speedup: %.2fx\n",
@@ -862,7 +923,6 @@ int main(int argc, char **argv) {
         }
         printf("\n");
     }
-
     // Run performance tests if requested.
     bool run_perf_tests = false;
     for (int i = 1; i < argc; ++i) {
@@ -871,16 +931,13 @@ int main(int argc, char **argv) {
             break;
         }
     }
-
     // Large scale tests: mainly for performance.
     if (run_perf_tests) {
         printf("Large scale tests (on scene 'DoubleSlit'):\n");
         using Scene = DoubleSlit;
-
         int32_t n_steps = Scene::t_end / Scene::dt;
         int32_t num_iters_outer_gpu = 1;
         int32_t num_iters_inner_gpu = 1;
-
         // GPU: wave_gpu_naive.
         Results gpu_naive_results;
         if (gpu_naive_correct) {
@@ -902,7 +959,6 @@ int main(int argc, char **argv) {
         } else {
             printf("  Skipping GPU naive implementation (incorrect)\n");
         }
-
         // GPU: wave_gpu_shmem.
         Results gpu_shmem_results;
         double naive_shmem_rel_rmse = 0.0;
@@ -930,18 +986,15 @@ int main(int argc, char **argv) {
         } else {
             printf("  Skipping GPU shared memory implementation (incorrect)\n");
         }
-
         if (gpu_naive_correct && gpu_shmem_correct && naive_shmem_rel_rmse < tolerance) {
             printf(
                 "  GPU naive -> GPU shared memory speedup: %.2fx\n",
                 gpu_naive_results.time_ms / gpu_shmem_results.time_ms);
-
         } else {
             printf("  GPU naive -> GPU shared memory speedup: N/A (incorrect)\n");
         }
         printf("\n");
     }
-
     // Generate animation if requested.
     bool a_flag = false;
     for (int i = 1; i < argc; ++i) {
@@ -950,11 +1003,9 @@ int main(int argc, char **argv) {
             break;
         }
     }
-
     if (a_flag) {
         using Scene = DoubleSlitSmallScale;
         int32_t n_steps = Scene::t_end / Scene::dt;
-
         // CPU.
         FFmpegFrames cpu_frames;
         wave_ffmpeg<Scene>(0.0f, n_steps, cpu_frames);
@@ -964,7 +1015,6 @@ int main(int argc, char **argv) {
         } else {
             std::cout << "CPU video has been generated." << std::endl;
         }
-
         // GPU naive.
         FFmpegFrames gpu_naive_frames;
         wave_ffmpeg_gpu<Scene>(0.0f, n_steps, gpu_naive_frames);
@@ -974,7 +1024,6 @@ int main(int argc, char **argv) {
         } else {
             std::cout << "GPU_naive video has been generated." << std::endl;
         }
-
         // GPU shared memory.
         FFmpegFrames gpu_shmem_frames;
         wave_ffmpeg_gpu_shmem<Scene>(0.0f, n_steps, gpu_shmem_frames);
@@ -985,6 +1034,5 @@ int main(int argc, char **argv) {
             std::cout << "GPU_shmem video has been generated." << std::endl;
         }
     }
-
     return 0;
 }
