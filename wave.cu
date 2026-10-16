@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -7,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 void cuda_check(cudaError_t code, const char *file, int line) {
@@ -188,15 +191,34 @@ std::pair<float *, float *> wave_gpu_naive(
 }
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Shared Memory)
-constexpr int IN_TILE_X = 20;
-constexpr int IN_TILE_Y = 20;
-constexpr int K = 2;
+// Compile-time tuning knobs; override with nvcc -DWAVE_IN_TILE_X=... etc.
+// Best measured defaults from results.csv (large scene, 129 and 257 steps):
+// input tile 64x64, K=8, output tile 48x48, thread block 32x8.
+// Recheck for a full-length 12800-step simulation before calling this globally optimal.
+#ifndef WAVE_IN_TILE_X
+#define WAVE_IN_TILE_X 64
+#endif
+#ifndef WAVE_IN_TILE_Y
+#define WAVE_IN_TILE_Y 64
+#endif
+#ifndef WAVE_K
+#define WAVE_K 8
+#endif
+constexpr int IN_TILE_X = WAVE_IN_TILE_X;
+constexpr int IN_TILE_Y = WAVE_IN_TILE_Y;
+constexpr int K = WAVE_K;
+static_assert(K > 0 && IN_TILE_X > 0 && IN_TILE_Y > 0,
+    "Tile sizes and K must be positive");
+
+// Host-side tuning knobs; change from --block-x/--block-y at runtime.
+// No kernel signature change is required.
+int wave_block_x = 32;
+int wave_block_y = 8;
 constexpr int OUT_TILE_X = IN_TILE_X - 2*K;
 constexpr int OUT_TILE_Y = IN_TILE_Y - 2*K;
 static_assert(OUT_TILE_X > 0 && OUT_TILE_Y > 0,
     "The timestep halo must leave a nonempty output tile");
 constexpr size_t shared_bytes = 2*IN_TILE_X*IN_TILE_Y*sizeof(float);
-
 template <typename Scene>
 __global__ void wave_gpu_shmem_multistep(
     float t0,
@@ -214,7 +236,6 @@ __global__ void wave_gpu_shmem_multistep(
     constexpr float dx = Scene::dx;
     constexpr float dt = Scene::dt;
     constexpr float coeff = c*c*dt*dt/(dx*dx);
-
     // for bx in range(gridDim.x)
         // for by in range(gridDim.y)
             // curr = sharedmem[IN_TILE_X*IN_TILE_Y]
@@ -228,18 +249,15 @@ __global__ void wave_gpu_shmem_multistep(
     int jy = threadIdx.y;
     int x_base = -K + bx*(OUT_TILE_X);
     int y_base = -K + by*(OUT_TILE_Y);
-
     // Load input tiles into shared mem
     for (int jy_base = 0; jy_base < IN_TILE_Y; jy_base += blockDim.y) {
         for (int jx_base = 0; jx_base < IN_TILE_X; jx_base += blockDim.x) {
                 // if 4+4+4 exceeds 4+4+2 fence on right
                 if (!(jx_base + jx < IN_TILE_X && jy_base + jy < IN_TILE_Y)) continue;
-
                 int x_global = x_base + jx_base + jx;
                 int y_global = y_base + jy_base + jy;
                 int i_local = (jy_base + jy)*IN_TILE_X + (jx_base + jx);
-
-                if (0 <= x_global && x_global < nx && 
+                if (0 <= x_global && x_global < nx &&
                     0 <= y_global && y_global < ny) { // thread in bounds (touch margins)
                     int i = y_global*nx + x_global;
                     prev[i_local] = read0[i];
@@ -248,27 +266,22 @@ __global__ void wave_gpu_shmem_multistep(
                     prev[i_local] = 0.0f;
                     curr[i_local] = 0.0f;
                 }
-        } // end jy_base
-    } // end jx_base
+        }
+    }
     __syncthreads();
-
-
     // Compute tiles, visual = 4-size block in 1D over IN_TILE = 20, margin of 2 both ends
+    // The comment above is an old 20x20 example; this file defaults to 64x64 with K=8.
     for (int k = 1; k <= steps_this_launch; k++) {
         float t = t0 + (first_step + k - 1)*dt;
-
         for (int jy_base = 0; jy_base < IN_TILE_Y; jy_base += blockDim.y) {
             for (int jx_base = 0; jx_base < IN_TILE_X; jx_base += blockDim.x) {
                 // only compute threads "pyramiding up" and in bounds
                 if (!(k <= jx_base + jx && jx_base + jx < IN_TILE_X - k &&
                       k <= jy_base + jy && jy_base + jy < IN_TILE_Y - k)) continue;
-                
                 int x_global = x_base + jx_base + jx;
                 int y_global = y_base + jy_base + jy;
                 int i_local = (jy_base + jy)*IN_TILE_X + (jx_base + jx);
-                
                 float next;
-                
                 if (x_global <= 0 || x_global >= nx - 1 ||
                     y_global <= 0 || y_global >= ny - 1 ||
                     Scene::is_wall(x_global, y_global)) {
@@ -291,13 +304,10 @@ __global__ void wave_gpu_shmem_multistep(
             } // end jx_base
         } // end jy_base
         __syncthreads(); // ensures all block of 4 finishes at same time before moving to next time step
-
         float *temp = prev;
         prev = curr;
         curr = temp;
     } // end k
-
-
     for (int jy_base = 0; jy_base < IN_TILE_Y; jy_base += blockDim.y) {
         for (int jx_base = 0; jx_base < IN_TILE_X; jx_base += blockDim.x) {
             // only write cells in output tile, otherwise
@@ -306,15 +316,12 @@ __global__ void wave_gpu_shmem_multistep(
             if (!(K <= jx_base + jx && jx_base + jx < IN_TILE_X - K &&
                   K <= jy_base + jy && jy_base + jy < IN_TILE_Y - K))
                 continue;
-
             int x_global = x_base + jx_base + jx;
             int y_global = y_base + jy_base + jy;
-            
             // If out of bounds, skip
             if (!(0 <= x_global && x_global < nx &&
                   0 <= y_global && y_global < ny))
                 continue;
-
             int i_local = (jy_base + jy)*IN_TILE_X + (jx_base + jx);
             int i = y_global*nx + x_global;
             write0[i] = prev[i_local];
@@ -322,7 +329,6 @@ __global__ void wave_gpu_shmem_multistep(
         } // end jx_base
     } // end jy_base
 }
-
 // 'wave_gpu_shmem':
 //
 // Input:
@@ -357,17 +363,15 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
-    dim3 block_size(8, 8);
+    dim3 block_size(wave_block_x, wave_block_y);
     dim3 num_blocks(
         (Scene::n_cells_x + OUT_TILE_X - 1) / OUT_TILE_X,
         (Scene::n_cells_y + OUT_TILE_Y - 1) / OUT_TILE_Y
     );
-    
     float *read0 = u0;
     float *write0 = extra0;
     float *read1 = u1;
     float *write1 = extra1;
-
     for (int32_t first_step = 0; first_step < n_steps; first_step += K) {
         int32_t steps = std::min(K, n_steps - first_step);
         wave_gpu_shmem_multistep<Scene><<<num_blocks, block_size, shared_bytes>>>(
@@ -853,7 +857,176 @@ int generate_animation(const FFmpegFrames &frames, std::string fname) {
     pclose(pipe);
     return 0;
 }
+// Use --bench-wave for a machine-readable performance and correctness test.
+// The normal lab main() below remains unchanged except for the early dispatch.
+struct WaveBenchmarkOptions {
+    std::string scene = "large";
+    int steps = 129;
+    int warmup = 2;
+    int repeats = 5;
+    int block_x = 32;
+    int block_y = 8;
+};
+
+template <typename Scene>
+int wave_benchmark_scene(const WaveBenchmarkOptions &options) {
+    constexpr int nx = Scene::n_cells_x;
+    constexpr int ny = Scene::n_cells_y;
+    const size_t count = size_t(nx) * size_t(ny);
+    const size_t bytes = count * sizeof(float);
+
+    // Start with reproducible, nonzero input states. This also tests the
+    // n_steps=1 case, for which a zero-input reference could be all zeros.
+    std::vector<float> initial0(count), initial1(count);
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t hash = uint32_t(i) * 747796405u + 2891336453u;
+        hash = (hash >> ((hash >> 28) + 4)) ^ hash;
+        initial0[i] = (float(int(hash & 1023u) - 512)) * 0.0001f;
+        initial1[i] = (float(int((hash >> 10) & 1023u) - 512)) * 0.0001f;
+    }
+
+    float *u0, *u1, *extra0, *extra1, *ref0, *ref1;
+    CUDA_CHECK(cudaMalloc(&u0, bytes));
+    CUDA_CHECK(cudaMalloc(&u1, bytes));
+    CUDA_CHECK(cudaMalloc(&extra0, bytes));
+    CUDA_CHECK(cudaMalloc(&extra1, bytes));
+    CUDA_CHECK(cudaMalloc(&ref0, bytes));
+    CUDA_CHECK(cudaMalloc(&ref1, bytes));
+
+    CUDA_CHECK(cudaMemcpy(ref0, initial0.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ref1, initial1.data(), bytes, cudaMemcpyHostToDevice));
+    auto reference = wave_gpu_naive<Scene>(0.0f, options.steps, ref0, ref1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> reference0(count), reference1(count);
+    CUDA_CHECK(cudaMemcpy(reference0.data(), reference.first, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(reference1.data(), reference.second, bytes, cudaMemcpyDeviceToHost));
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    std::vector<float> times;
+    std::pair<float *, float *> result{nullptr, nullptr};
+
+    for (int r = -options.warmup; r < options.repeats; ++r) {
+        // Reset before timing. Allocation, initialization, and CPU/GPU
+        // transfers are not part of the measured kernel runtime.
+        CUDA_CHECK(cudaMemcpy(u0, initial0.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(u1, initial1.data(), bytes, cudaMemcpyHostToDevice));
+
+        CUDA_CHECK(cudaEventRecord(start));
+        result = wave_gpu_shmem<Scene>(0.0f, options.steps,
+                                        u0, u1, extra0, extra1);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float elapsed = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+        if (r >= 0) times.push_back(elapsed);
+    }
+    std::sort(times.begin(), times.end());
+    const double median_ms = times[times.size() / 2];
+
+    std::vector<float> actual0(count), actual1(count);
+    CUDA_CHECK(cudaMemcpy(actual0.data(), result.first, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(actual1.data(), result.second, bytes, cudaMemcpyDeviceToHost));
+
+    // Relative L2 error against the naive GPU baseline for BOTH time states.
+    // If a reference is identically zero, use absolute RMS error instead.
+    double ref_sum0 = 0, ref_sum1 = 0, diff_sum0 = 0, diff_sum1 = 0;
+    double max_abs_diff = 0;
+    for (size_t i = 0; i < count; ++i) {
+        double e0 = double(actual0[i]) - reference0[i];
+        double e1 = double(actual1[i]) - reference1[i];
+        diff_sum0 += e0 * e0;
+        diff_sum1 += e1 * e1;
+        ref_sum0 += double(reference0[i]) * reference0[i];
+        ref_sum1 += double(reference1[i]) * reference1[i];
+        max_abs_diff = std::max(max_abs_diff, std::max(std::abs(e0), std::abs(e1)));
+    }
+    const double error0 = std::sqrt(diff_sum0 / (ref_sum0 > 0 ? ref_sum0 : count));
+    const double error1 = std::sqrt(diff_sum1 / (ref_sum1 > 0 ? ref_sum1 : count));
+    const bool correct = std::isfinite(error0) && std::isfinite(error1) &&
+                         error0 < 1.0e-3 && error1 < 1.0e-3;
+
+    // The sweep script reads this single JSON-prefixed line.
+    std::printf(
+        "BENCH_JSON={\"status\":\"ok\",\"scene\":\"%s\","
+        "\"steps\":%d,\"tile_x\":%d,\"tile_y\":%d,\"k\":%d,"
+        "\"block_x\":%d,\"block_y\":%d,\"out_x\":%d,\"out_y\":%d,"
+        "\"shared_bytes\":%zu,\"launches\":%d,\"time_ms\":%.7g,"
+        "\"error_prev\":%.8g,\"error_curr\":%.8g,"
+        "\"max_abs_diff\":%.8g,\"correct\":%s}\n",
+        options.scene.c_str(), options.steps, IN_TILE_X, IN_TILE_Y, K,
+        options.block_x, options.block_y, OUT_TILE_X, OUT_TILE_Y,
+        shared_bytes, (options.steps + K - 1) / K, median_ms,
+        error0, error1, max_abs_diff, correct ? "true" : "false"
+    );
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(u0));
+    CUDA_CHECK(cudaFree(u1));
+    CUDA_CHECK(cudaFree(extra0));
+    CUDA_CHECK(cudaFree(extra1));
+    CUDA_CHECK(cudaFree(ref0));
+    CUDA_CHECK(cudaFree(ref1));
+    return correct ? 0 : 3;
+}
+
+int wave_benchmark_cli(int argc, char **argv) {
+    WaveBenchmarkOptions options;
+    for (int i = 2; i < argc; ++i) {
+        std::string flag = argv[i];
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "Expected a value after %s\n", flag.c_str());
+            return 2;
+        }
+        std::string value = argv[++i];
+        try {
+            if (flag == "--scene") options.scene = value;
+            else if (flag == "--steps") options.steps = std::stoi(value);
+            else if (flag == "--warmup") options.warmup = std::stoi(value);
+            else if (flag == "--repeats") options.repeats = std::stoi(value);
+            else if (flag == "--block-x") options.block_x = std::stoi(value);
+            else if (flag == "--block-y") options.block_y = std::stoi(value);
+            else {
+                std::fprintf(stderr, "Unknown benchmark option: %s\n", flag.c_str());
+                return 2;
+            }
+        } catch (const std::exception &) {
+            std::fprintf(stderr, "Invalid value for %s: %s\n", flag.c_str(), value.c_str());
+            return 2;
+        }
+    }
+    if ((options.scene != "small" && options.scene != "large") ||
+        options.steps <= 0 || options.warmup < 0 || options.repeats <= 0 ||
+        options.block_x <= 0 || options.block_y <= 0) {
+        std::fprintf(stderr, "Invalid benchmark settings.\n");
+        return 2;
+    }
+    wave_block_x = options.block_x;
+    wave_block_y = options.block_y;
+
+    int gpu = 0;
+    cudaDeviceProp props;
+    CUDA_CHECK(cudaGetDevice(&gpu));
+    CUDA_CHECK(cudaGetDeviceProperties(&props, gpu));
+    if (wave_block_x > props.maxThreadsDim[0] ||
+        wave_block_y > props.maxThreadsDim[1] ||
+        (int64_t)wave_block_x * wave_block_y > props.maxThreadsPerBlock ||
+        shared_bytes > size_t(props.sharedMemPerBlock)) {
+        std::fprintf(stderr, "Invalid block or shared-memory configuration for GPU %s\n", props.name);
+        return 2;
+    }
+    return options.scene == "small"
+        ? wave_benchmark_scene<DoubleSlitSmallScale>(options)
+        : wave_benchmark_scene<DoubleSlit>(options);
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench-wave") {
+        return wave_benchmark_cli(argc, argv);
+    }
     // Small scale tests: mainly for correctness.
     double tolerance = 3e-2;
     bool gpu_naive_correct = false;
